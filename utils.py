@@ -8,25 +8,30 @@ import psycopg
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, OperationalError
-from tqdm import tqdm
 
 import cvm_model.sql as sql
-
 
 T = TypeVar('T')
 
 
-def _retry(engine: Engine, fn: Callable[[], T], name: str, retries: int = 3) -> T:
-    # Retry only connection-level failures; SQL/data errors should fail immediately.
+def _retry(engine: Engine, fn: Callable[[], T], name: str, retries: int = 5) -> T:
+    """ Retry the same error classes as the old magpie helper. """
+
     markers = [
-        'eof detected',
-        'ssl syscall error',
-        'remote server read/write error',
+        'connection',
+        'segments are down',
+        'curl',
+        'adminshutdown',
         'terminating connection',
-        'server closed the connection',
-        'connection not open',
-        'connection already closed',
-        'odyssey',
+        'transfer closed with outstanding read data remaining',
+        'transfer error',
+        'response stream',
+        'ssl syscall',
+        'out of memory',
+        'receive from seg',
+        'workfile per segment',
+        'workfiles per query',
+        'insufficientresources',
     ]
 
     for attempt in range(1, retries + 1):
@@ -41,7 +46,7 @@ def _retry(engine: Engine, fn: Callable[[], T], name: str, retries: int = 3) -> 
                 logging.exception(f'{name} failed on attempt {attempt}/{retries}')
                 raise
 
-            wait_seconds = 15 * attempt
+            wait_seconds = 30
             logging.warning(f'{name} failed on attempt {attempt}/{retries}. Retrying in {wait_seconds} seconds...')
             time.sleep(wait_seconds)
 
@@ -49,13 +54,13 @@ def _retry(engine: Engine, fn: Callable[[], T], name: str, retries: int = 3) -> 
 
 
 def get_df(engine: Engine, query: str, disable_broadcast: bool = False) -> pd.DataFrame:
-    # Use a fresh connection per query to avoid stale Odyssey/GP connections.
+    """ Load df like magpie.execute_custom_query_gp for select queries. """
+
     def run() -> pd.DataFrame:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             if disable_broadcast:
                 conn.execute(text('set optimizer_enable_motion_broadcast = off'))
-            conn.execute(text('set optimizer = on'))
-            df = pd.read_sql_query(text(query), conn)
+            df = pd.read_sql(text(query), conn)
         engine.dispose()
         return df
 
@@ -63,36 +68,23 @@ def get_df(engine: Engine, query: str, disable_broadcast: bool = False) -> pd.Da
 
 
 def get_df_stream(engine: Engine, query: str, disable_broadcast: bool = False) -> pd.DataFrame:
-    # Chunked loading is useful for wide or heavy feature blocks.
-    chunk_size = 250_000
+    """ Compatibility wrapper for heavy feature blocks.
 
-    def run() -> pd.DataFrame:
-        chunks = []
-        with engine.connect() as conn:
-            if disable_broadcast:
-                conn.execute(text('set optimizer_enable_motion_broadcast = off'))
-            conn.execute(text('set optimizer = on'))
-            stream_conn = conn.execution_options(stream_results=True, max_row_buffer=chunk_size)
-            reader = pd.read_sql_query(text(query), stream_conn, chunksize=chunk_size)
+    Do not use server-side streaming cursors here: in GP/Odyssey they may create
+    unstable execution plans and fail with workfile limits. A regular read is
+    closer to the old project helper behavior.
+    """
 
-            with tqdm(desc='Loading data', unit=' chunk') as pbar:
-                for chunk in reader:
-                    chunks.append(chunk)
-                    pbar.update(1)
-                    pbar.set_postfix({'rows': f'{sum(len(x) for x in chunks):,}'})
-
-        engine.dispose()
-        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-
-    return _retry(engine, run, 'get_df_stream')
+    return get_df(engine, query, disable_broadcast=disable_broadcast)
 
 
 def execute_query(engine: Engine, query: str, disable_broadcast: bool = False) -> None:
+    """ Execute custom query. """
+
     def run() -> None:
         with engine.begin() as conn:
             if disable_broadcast:
                 conn.execute(text('set optimizer_enable_motion_broadcast = off'))
-            conn.execute(text('set optimizer = on'))
             conn.execute(text(query))
         engine.dispose()
 
@@ -100,7 +92,8 @@ def execute_query(engine: Engine, query: str, disable_broadcast: bool = False) -
 
 
 def upload_df(engine: Engine, df: pd.DataFrame, table: str, rewrite: bool = True) -> None:
-    # Create a GP table with simple dtype mapping, then load data through COPY.
+    """ Create a GP table with dtype mapping and load data through copy. """
+
     if rewrite:
         mapper = {
             'object': 'varchar',
@@ -147,27 +140,7 @@ def upload_df(engine: Engine, df: pd.DataFrame, table: str, rewrite: bool = True
             engine.dispose()
 
     _retry(engine, run, f'upload_df({table})')
-
-
-def remove_s3_prefix(s3_credentials: Any, bucket: str, prefix: str) -> None:
-    clean_prefix = prefix.strip('/')
-    path = f'{bucket}/{clean_prefix}'
-    if s3_credentials.s3fs.exists(path):
-        s3_credentials.s3fs.rm(path, recursive=True)
-
-
-def list_s3_objects(s3_credentials: Any, bucket: str, prefix: str) -> List[str]:
-    clean_prefix = prefix.strip('/')
-    path = f'{bucket}/{clean_prefix}'
-    return list(s3_credentials.s3fs.find(path)) if s3_credentials.s3fs.exists(path) else []
-
-
-def save_df_to_s3(df: pd.DataFrame, s3_credentials: Any, bucket: str, prefix: str) -> None:
-    clean_prefix = prefix.strip('/')
-    path = f'{bucket}/{clean_prefix}'
-    s3_credentials.s3fs.makedirs(path, exist_ok=True)
-    with s3_credentials.s3fs.open(f'{path}/part-00000.parquet', 'wb') as file:
-        df.to_parquet(file, index=False)
+    execute_query(engine, f'analyze {table}')
 
 
 def load_features(
@@ -178,9 +151,11 @@ def load_features(
     fav_omni_features_table: str,
     preperiod_months: List[int],
 ) -> pd.DataFrame:
+    """Load selected features with SQL queries"""
+
     query_kwargs = {'aud': aud_query, 'date': date, 'month': preperiod_months[0]}
 
-    # Load recency blocks first because later preprocessing uses them for tendency features.
+    # Load recency features and validate merges
     for name, query in [
         ('recency', sql.recency_query.format(aud=aud_query, date=date, month=preperiod_months[2])),
         ('perf_recency', sql.perf_recency_query.format(aud=aud_query, date=date, month=preperiod_months[2])),
@@ -197,7 +172,7 @@ def load_features(
 
     df['perf_recency'] = df['perf_recency'].fillna(999)
 
-    # Materialize favorite OMNI features once; several later queries reuse this table.
+    # Create favorite OMNI features table
     fav_query = sql.fav_omni_features_create_query.format(**query_kwargs)
     create_query = sql.create_table_from_select_query.format(
         table=fav_omni_features_table,
@@ -206,9 +181,10 @@ def load_features(
     )
     execute_query(engine, f'drop table if exists {fav_omni_features_table}')
     execute_query(engine, create_query)
+    execute_query(engine, f'analyze {fav_omni_features_table}')
     query_kwargs['fav_omni_features_table'] = fav_omni_features_table
 
-    # Each tuple contains: feature block name, SQL template, periods, and loading mode.
+    # Each tuple contains: feature block name, SQL query and loading periods.
     blocks = [
         ('cheques', sql.cheque_query, [preperiod_months[0]], True),
         ('cheques_short', sql.cheque_query_short, preperiod_months[1:], True),
@@ -248,8 +224,31 @@ def load_features(
             logging.info(f'{block_name}: added {df.shape[1] - cols_before} columns; shape={df.shape}')
             df.to_parquet('df_cache.parquet')
 
-    # Missing counters and sums mean no matching activity, so zero is the natural value.
+    # Fill missing values
     null_cols = [col for col in df.columns if any(marker in col for marker in ['count', 'sum', 'rto', 'aov'])]
     df[null_cols] = df[null_cols].fillna(0)
 
     return df
+
+
+# S3 helpers
+
+def remove_s3_prefix(s3_credentials: Any, bucket: str, prefix: str) -> None:
+    clean_prefix = prefix.strip('/')
+    path = f'{bucket}/{clean_prefix}'
+    if s3_credentials.s3fs.exists(path):
+        s3_credentials.s3fs.rm(path, recursive=True)
+
+
+def list_s3_objects(s3_credentials: Any, bucket: str, prefix: str) -> List[str]:
+    clean_prefix = prefix.strip('/')
+    path = f'{bucket}/{clean_prefix}'
+    return list(s3_credentials.s3fs.find(path)) if s3_credentials.s3fs.exists(path) else []
+
+
+def save_df_to_s3(df: pd.DataFrame, s3_credentials: Any, bucket: str, prefix: str) -> None:
+    clean_prefix = prefix.strip('/')
+    path = f'{bucket}/{clean_prefix}'
+    s3_credentials.s3fs.makedirs(path, exist_ok=True)
+    with s3_credentials.s3fs.open(f'{path}/part-00000.parquet', 'wb') as file:
+        df.to_parquet(file, index=False)
