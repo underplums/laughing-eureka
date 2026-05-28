@@ -1,7 +1,7 @@
 import io
 import logging
 import time
-from typing import Any, Callable, List, Sequence, TypeVar, cast
+from typing import Any, Callable, List, TypeVar, cast
 
 import pandas as pd
 import psycopg
@@ -16,11 +16,9 @@ import cvm_model.sql as sql
 T = TypeVar('T')
 
 
-def _is_transient_db_error(error: Exception) -> bool:
-    '''Return True for connection-level errors worth retrying.'''
-
-    error_text = str(error).lower()
-    transient_markers = [
+def _retry(engine: Engine, fn: Callable[[], T], name: str, retries: int = 3) -> T:
+    # Retry only connection-level failures; SQL/data errors should fail immediately.
+    markers = [
         'eof detected',
         'ssl syscall error',
         'remote server read/write error',
@@ -31,178 +29,80 @@ def _is_transient_db_error(error: Exception) -> bool:
         'odyssey',
     ]
 
-    return isinstance(error, (OperationalError, DBAPIError, psycopg.OperationalError)) or any(
-        marker in error_text for marker in transient_markers
-    )
-
-
-def _run_with_retries(
-    engine: Engine,
-    operation: Callable[[], T],
-    operation_name: str,
-    retries: int = 3,
-    sleep_seconds: int = 15,
-) -> T:
-    '''Run a DB operation with engine reset between transient failures.'''
-
-    last_error: Exception | None = None
-
     for attempt in range(1, retries + 1):
         try:
-            return operation()
+            return fn()
         except Exception as error:
-            last_error = error
             engine.dispose()
+            is_transient = isinstance(error, (OperationalError, DBAPIError, psycopg.OperationalError))
+            is_transient = is_transient or any(marker in str(error).lower() for marker in markers)
 
-            if not _is_transient_db_error(error) or attempt == retries:
-                logging.exception(f'{operation_name} failed on attempt {attempt}/{retries}')
+            if not is_transient or attempt == retries:
+                logging.exception(f'{name} failed on attempt {attempt}/{retries}')
                 raise
 
-            wait_seconds = sleep_seconds * attempt
-            logging.warning(
-                f'{operation_name} failed on attempt {attempt}/{retries}: {error}. '
-                f'Retrying in {wait_seconds} seconds...'
-            )
+            wait_seconds = 15 * attempt
+            logging.warning(f'{name} failed on attempt {attempt}/{retries}. Retrying in {wait_seconds} seconds...')
             time.sleep(wait_seconds)
 
-    assert last_error is not None
-    raise last_error
+    raise RuntimeError(f'{name} failed')
 
 
 def get_df(engine: Engine, query: str, disable_broadcast: bool = False) -> pd.DataFrame:
-    '''Load query result from GP into pandas with fresh connections and retries.'''
-
-    def operation() -> pd.DataFrame:
+    # Use a fresh connection per query to avoid stale Odyssey/GP connections.
+    def run() -> pd.DataFrame:
         with engine.connect() as conn:
             if disable_broadcast:
                 conn.execute(text('set optimizer_enable_motion_broadcast = off'))
             conn.execute(text('set optimizer = on'))
             df = pd.read_sql_query(text(query), conn)
-
         engine.dispose()
         return df
 
-    return _run_with_retries(engine, operation, 'get_df')
+    return _retry(engine, run, 'get_df')
 
 
 def get_df_stream(engine: Engine, query: str, disable_broadcast: bool = False) -> pd.DataFrame:
-    '''Load a large query result from GP into pandas by chunks.'''
-
+    # Chunked loading is useful for wide or heavy feature blocks.
     chunk_size = 250_000
 
-    def operation() -> pd.DataFrame:
+    def run() -> pd.DataFrame:
+        chunks = []
         with engine.connect() as conn:
             if disable_broadcast:
                 conn.execute(text('set optimizer_enable_motion_broadcast = off'))
             conn.execute(text('set optimizer = on'))
+            stream_conn = conn.execution_options(stream_results=True, max_row_buffer=chunk_size)
+            reader = pd.read_sql_query(text(query), stream_conn, chunksize=chunk_size)
 
-            stream_conn = conn.execution_options(
-                stream_results=True,
-                max_row_buffer=chunk_size,
-            )
-            chunks = pd.read_sql_query(text(query), stream_conn, chunksize=chunk_size)
-
-            all_chunks = []
             with tqdm(desc='Loading data', unit=' chunk') as pbar:
-                for chunk in chunks:
-                    all_chunks.append(chunk)
+                for chunk in reader:
+                    chunks.append(chunk)
                     pbar.update(1)
-                    pbar.set_postfix({'rows': f'{sum(len(c) for c in all_chunks):,}'})
+                    pbar.set_postfix({'rows': f'{sum(len(x) for x in chunks):,}'})
 
         engine.dispose()
-        if not all_chunks:
-            return pd.DataFrame()
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
-        return pd.concat(all_chunks, ignore_index=True)
-
-    return _run_with_retries(engine, operation, 'get_df_stream')
+    return _retry(engine, run, 'get_df_stream')
 
 
-def execute_query(
-    engine: Engine,
-    query: str,
-    disable_broadcast: bool = False,
-    enable_optimizer: bool = True,
-) -> None:
-    '''Execute arbitrary SQL query in GP with connection reset on transient failures.'''
-
-    def operation() -> None:
+def execute_query(engine: Engine, query: str, disable_broadcast: bool = False) -> None:
+    def run() -> None:
         with engine.begin() as conn:
             if disable_broadcast:
                 conn.execute(text('set optimizer_enable_motion_broadcast = off'))
-            if enable_optimizer:
-                conn.execute(text('set optimizer = on'))
+            conn.execute(text('set optimizer = on'))
             conn.execute(text(query))
-
         engine.dispose()
 
-    _run_with_retries(engine, operation, 'execute_query')
+    _retry(engine, run, 'execute_query')
 
 
-def copy_dataframe_csv(
-    engine: Engine,
-    df: pd.DataFrame,
-    table_name: str,
-    batch_size_mb: float = 100,
-) -> None:
-    '''Upload pandas DataFrame into GP table through COPY.'''
-
-    total_size = float(df.memory_usage(deep=True).sum())
-    total_rows = len(df)
-    bytes_per_row = total_size / max(total_rows, 1)
-    rows_per_batch = max(int((batch_size_mb * 1024 * 1024) // max(bytes_per_row, 1)), 1)
-
-    logging.info(
-        f'trying to load using csv: table_name: {table_name}; '
-        f'total_size_mb: {total_size / 1024 / 1024:_.2f}; '
-        f'total_rows: {total_rows:_}; bytes_per_row {bytes_per_row:_.2f}; '
-        f'rows_per_batch: {rows_per_batch:_}...'
-    )
-
-    columns = ', '.join(df.columns)
-    copy_sql = f'COPY {table_name} ({columns}) FROM STDIN WITH CSV'.encode()
-
-    def operation() -> None:
-        conn = cast(psycopg.Connection[Any], engine.raw_connection())
-        try:
-            with conn.cursor() as cursor:
-                with cursor.copy(copy_sql) as copy:
-                    for batch_n, start in enumerate(range(0, len(df), rows_per_batch)):
-                        logging.info(f'loading batch: {batch_n:05d}...')
-                        end = start + rows_per_batch
-                        batch = df.iloc[start:end]
-
-                        csv_buffer = io.StringIO()
-                        batch.to_csv(csv_buffer, index=False, header=False)
-                        csv_buffer.seek(0)
-
-                        copy.write(csv_buffer.getvalue())
-
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-            engine.dispose()
-
-    _run_with_retries(engine, operation, f'copy_dataframe_csv({table_name})')
-    logging.info(f'done loading into: {table_name}')
-
-
-def upload_df(
-    engine: Engine,
-    df: pd.DataFrame,
-    table: str,
-    rewrite: bool = True,
-    distributed_by_contact: bool = True,
-) -> None:
-    '''Upload pandas DataFrame into a GP table.'''
-
+def upload_df(engine: Engine, df: pd.DataFrame, table: str, rewrite: bool = True) -> None:
+    # Create a GP table with simple dtype mapping, then load data through COPY.
     if rewrite:
-        execute_query(engine, f'drop table if exists {table}')
-
-        format_mapper = {
+        mapper = {
             'object': 'varchar',
             'int32': 'int',
             'int64': 'int',
@@ -213,95 +113,103 @@ def upload_df(
             'bool': 'bool',
             'datetime64[ns]': 'date',
         }
+        cols = ',\n'.join(f'{col} {mapper[str(df[col].dtype)]}' for col in df.columns)
 
-        columns_str = ''
-        for i, column in enumerate(df.columns):
-            columns_str += ', ' if i > 0 else ''
-            columns_str += f'{column} {format_mapper[str(df[column].dtype)]}'
-            columns_str += '\n' if i + 1 < len(df.columns) else ''
-
-        create_table_query = sql.create_table_from_cols_query.format(
-            table=table,
-            cols=columns_str,
-        )
-
-        if distributed_by_contact is False:
-            create_table_query = create_table_query.replace(
-                'distributed by(contact_id)',
-                'distributed randomly',
-            )
-
-        execute_query(engine, create_table_query)
+        execute_query(engine, f'drop table if exists {table}')
+        execute_query(engine, sql.create_table_from_cols_query.format(table=table, cols=cols))
         execute_query(engine, f'grant select on {table} to cvm_sbx')
         execute_query(engine, f'grant select on {table} to lipchanskiy_k_v')
         execute_query(engine, f'grant select on {table} to kirilinaea')
 
-    copy_dataframe_csv(engine, df, table)
+    total_size = float(df.memory_usage(deep=True).sum())
+    bytes_per_row = total_size / max(len(df), 1)
+    rows_per_batch = max(int((100 * 1024 * 1024) // max(bytes_per_row, 1)), 1)
+    columns = ', '.join(df.columns)
+    copy_sql = f'COPY {table} ({columns}) FROM STDIN WITH CSV'.encode()
+
+    def run() -> None:
+        conn = cast(psycopg.Connection[Any], engine.raw_connection())
+        try:
+            with conn.cursor() as cursor:
+                with cursor.copy(copy_sql) as copy:
+                    for batch_n, start in enumerate(range(0, len(df), rows_per_batch)):
+                        logging.info(f'Loading {table} batch {batch_n:05d}')
+                        buffer = io.StringIO()
+                        df.iloc[start:start + rows_per_batch].to_csv(buffer, index=False, header=False)
+                        buffer.seek(0)
+                        copy.write(buffer.getvalue())
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+            engine.dispose()
+
+    _retry(engine, run, f'upload_df({table})')
 
 
 def remove_s3_prefix(s3_credentials: Any, bucket: str, prefix: str) -> None:
-    '''Remove an S3 prefix if it exists.'''
-
     clean_prefix = prefix.strip('/')
     path = f'{bucket}/{clean_prefix}'
-    fs = s3_credentials.s3fs
-
-    if fs.exists(path):
-        logging.info(f'Removing S3 prefix: s3://{path}')
-        fs.rm(path, recursive=True)
+    if s3_credentials.s3fs.exists(path):
+        s3_credentials.s3fs.rm(path, recursive=True)
 
 
-def list_s3_objects(s3_credentials: Any, bucket: str, prefix: str) -> list[str]:
-    '''List all S3 objects under a prefix.'''
-
+def list_s3_objects(s3_credentials: Any, bucket: str, prefix: str) -> List[str]:
     clean_prefix = prefix.strip('/')
     path = f'{bucket}/{clean_prefix}'
-    fs = s3_credentials.s3fs
-
-    if not fs.exists(path):
-        return []
-
-    return list(fs.find(path))
+    return list(s3_credentials.s3fs.find(path)) if s3_credentials.s3fs.exists(path) else []
 
 
 def save_df_to_s3(df: pd.DataFrame, s3_credentials: Any, bucket: str, prefix: str) -> None:
-    '''Save a pandas DataFrame as a single parquet part under an S3 prefix.'''
-
     clean_prefix = prefix.strip('/')
     path = f'{bucket}/{clean_prefix}'
-    file_path = f'{path}/part-00000.parquet'
-    fs = s3_credentials.s3fs
-
-    fs.makedirs(path, exist_ok=True)
-    with fs.open(file_path, 'wb') as file:
+    s3_credentials.s3fs.makedirs(path, exist_ok=True)
+    with s3_credentials.s3fs.open(f'{path}/part-00000.parquet', 'wb') as file:
         df.to_parquet(file, index=False)
 
-    logging.info(f'Saved dataframe to s3://{file_path}')
 
+def load_features(
+    engine: Engine,
+    df: pd.DataFrame,
+    aud_query: str,
+    date: str,
+    fav_omni_features_table: str,
+    preperiod_months: List[int],
+) -> pd.DataFrame:
+    query_kwargs = {'aud': aud_query, 'date': date, 'month': preperiod_months[0]}
 
-def merge_features(df: pd.DataFrame, df_part: pd.DataFrame, block_name: str) -> pd.DataFrame:
-    '''Merge a feature block and fail fast if it duplicates audience rows.'''
+    # Load recency blocks first because later preprocessing uses them for tendency features.
+    for name, query in [
+        ('recency', sql.recency_query.format(aud=aud_query, date=date, month=preperiod_months[2])),
+        ('perf_recency', sql.perf_recency_query.format(aud=aud_query, date=date, month=preperiod_months[2])),
+    ]:
+        df_part = get_df(engine, query)
+        assert 'contact_id' in df_part.columns, f'{name}: contact_id is missing'
+        assert df_part['contact_id'].is_unique, f'{name}: duplicate contact_id values'
 
-    assert 'contact_id' in df_part.columns, f'{block_name}: contact_id is missing in df_part'
-    assert df_part['contact_id'].is_unique, f'{block_name}: df_part contains duplicate contact_id values'
+        rows_before = len(df)
+        cols_before = df.shape[1]
+        df = df.merge(df_part, on='contact_id', how='left')
+        assert len(df) == rows_before, f'{name}: row count changed after merge'
+        logging.info(f'{name}: added {df.shape[1] - cols_before} columns; shape={df.shape}')
 
-    rows_before = len(df)
-    cols_before = df.shape[1]
-    df = df.merge(df_part, on='contact_id', how='left')
+    df['perf_recency'] = df['perf_recency'].fillna(999)
 
-    assert len(df) == rows_before, f'{block_name}: row count changed after merge'
-    logging.info(
-        f'{block_name}: added {df.shape[1] - cols_before} columns. '
-        f'Dataset shape: {df.shape}'
+    # Materialize favorite OMNI features once; several later queries reuse this table.
+    fav_query = sql.fav_omni_features_create_query.format(**query_kwargs)
+    create_query = sql.create_table_from_select_query.format(
+        table=fav_omni_features_table,
+        query=fav_query,
+        distribution_col='contact_id',
     )
+    execute_query(engine, f'drop table if exists {fav_omni_features_table}')
+    execute_query(engine, create_query)
+    query_kwargs['fav_omni_features_table'] = fav_omni_features_table
 
-    return df
-
-
-def _feature_query_plan(preperiod_months: Sequence[int]) -> list[tuple[str, str, Sequence[int], bool]]:
-    '''Describe feature SQL blocks: name, query, periods, use_stream.'''
-
-    return [
+    # Each tuple contains: feature block name, SQL template, periods, and loading mode.
+    blocks = [
         ('cheques', sql.cheque_query, [preperiod_months[0]], True),
         ('cheques_short', sql.cheque_query_short, preperiod_months[1:], True),
         ('logins', sql.app_query, preperiod_months, True),
@@ -313,109 +221,35 @@ def _feature_query_plan(preperiod_months: Sequence[int]) -> list[tuple[str, str,
         ('accepts', sql.accept_query, preperiod_months, True),
         ('bonuses', sql.bonus_query, preperiod_months, False),
         ('levels', sql.level_query, preperiod_months, False),
+        ('static_features', sql.static_features_query, [None], False),
+        ('dac_history', sql.dac_months_count_query, [None], False),
     ]
 
+    for name, query, months, stream in blocks:
+        for month in months:
+            if month is None:
+                logging.info(f'Loading {name} features')
+                block_name = name
+            else:
+                logging.info(f'Loading {name} features for {month} months')
+                query_kwargs['month'] = month
+                block_name = f'{name}_{month}m'
 
-def _load_sql_block(
-    engine: Engine,
-    query_template: str,
-    query_kwargs: dict[str, Any],
-    block_name: str,
-    use_stream: bool = False,
-) -> pd.DataFrame:
-    query = query_template.format(**query_kwargs)
-    if use_stream:
-        return get_df_stream(engine, query)
-    return get_df(engine, query)
+            loader = get_df_stream if stream else get_df
 
+            df_part = loader(engine, query.format(**query_kwargs))
+            assert 'contact_id' in df_part.columns, f'{block_name}: contact_id is missing'
+            assert df_part['contact_id'].is_unique, f'{block_name}: duplicate contact_id values'
 
-def _fill_default_nulls(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    null_cols = [
-        col
-        for col in df.columns
-        if any(marker in col for marker in ['count', 'sum', 'rto', 'aov'])
-    ]
-    df[null_cols] = df[null_cols].fillna(0)
-
-    return df
-
-
-def load_features(
-    engine: Engine,
-    df: pd.DataFrame,
-    aud_query: str,
-    date: str,
-    fav_omni_features_table: str,
-    preperiod_months: List[int],
-) -> pd.DataFrame:
-    '''Load model feature blocks from GP and merge them into the base dataset.'''
-
-    query_kwargs: dict[str, Any] = {
-        'aud': aud_query,
-        'date': date,
-        'month': preperiod_months[0],
-    }
-
-    logging.info('Loading recency features...')
-    df_part = get_df(
-        engine,
-        sql.recency_query.format(
-            aud=aud_query,
-            date=date,
-            month=preperiod_months[2],
-        ),
-    )
-    df = merge_features(df, df_part, 'recency')
-
-    logging.info('Loading perf recency features...')
-    df_part = get_df(
-        engine,
-        sql.perf_recency_query.format(
-            aud=aud_query,
-            date=date,
-            month=preperiod_months[2],
-        ),
-    )
-    df = merge_features(df, df_part, 'perf_recency')
-    if 'perf_recency' in df.columns:
-        df['perf_recency'] = df['perf_recency'].fillna(999)
-
-    logging.info('Creating favorite OMNI features temp table...')
-    fav_omni_query = sql.fav_omni_features_create_query.format(**query_kwargs)
-    create_query = sql.create_table_from_select_query.format(
-        table=fav_omni_features_table,
-        query=fav_omni_query,
-        distribution_col='contact_id',
-    )
-    execute_query(engine, f'drop table if exists {fav_omni_features_table}')
-    execute_query(engine, create_query)
-
-    query_kwargs['fav_omni_features_table'] = fav_omni_features_table
-
-    for block_name, query_template, periods, use_stream in _feature_query_plan(preperiod_months):
-        for month in periods:
-            logging.info(f'Loading {block_name} features for {month} months...')
-            query_kwargs['month'] = month
-
-            df_part = _load_sql_block(
-                engine=engine,
-                query_template=query_template,
-                query_kwargs=query_kwargs,
-                block_name=f'{block_name}_{month}m',
-                use_stream=use_stream,
-            )
-            df = merge_features(df, df_part, f'{block_name}_{month}m')
+            rows_before = len(df)
+            cols_before = df.shape[1]
+            df = df.merge(df_part, on='contact_id', how='left')
+            assert len(df) == rows_before, f'{block_name}: row count changed after merge'
+            logging.info(f'{block_name}: added {df.shape[1] - cols_before} columns; shape={df.shape}')
             df.to_parquet('df_cache.parquet')
 
-    logging.info('Loading static features...')
-    df_part = get_df(engine, sql.static_features_query.format(**query_kwargs))
-    df = merge_features(df, df_part, 'static_features')
+    # Missing counters and sums mean no matching activity, so zero is the natural value.
+    null_cols = [col for col in df.columns if any(marker in col for marker in ['count', 'sum', 'rto', 'aov'])]
+    df[null_cols] = df[null_cols].fillna(0)
 
-    logging.info('Loading DAC history features...')
-    df_part = get_df(engine, sql.dac_months_count_query.format(**query_kwargs))
-    df = merge_features(df, df_part, 'dac_history')
-
-    df = _fill_default_nulls(df)
     return df
