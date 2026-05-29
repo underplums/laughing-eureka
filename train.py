@@ -18,23 +18,24 @@ from catboost import CatBoostClassifier
 from mlflow import MlflowClient
 from mlflow.models.signature import infer_signature
 from sklearn.metrics import (
+    ConfusionMatrixDisplay,
     balanced_accuracy_score,
     brier_score_loss,
     confusion_matrix,
-    ConfusionMatrixDisplay,
     f1_score,
+    fbeta_score,
     log_loss,
     matthews_corrcoef,
     precision_score,
     recall_score,
+    roc_auc_score,
 )
 from sklearn.model_selection import StratifiedKFold
 
 import cvm_ml_metrics.classification as mc
-import magpie.sql_utils as su
-from cvm_model.io import State
 import cvm_model.functions as func
 import cvm_model.utils as utils
+from cvm_model.io import State
 from cvm_model.parameters import (
     RANDOM_STATE,
     artifacts_dir,
@@ -50,15 +51,14 @@ from cvm_model.parameters import (
     train_data_stat_suffix,
 )
 
-
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 pd.set_option('display.max_columns', None)
 
 metrics_lib: Dict[str, Any] = {
     'log_loss': log_loss,
-    'sensitivity': lambda x, y: mc.sensitivity_specificity(x, y)[0],
-    'specificity': lambda x, y: mc.sensitivity_specificity(x, y)[1],
+    'sensitivity': lambda y, p: mc.sensitivity_specificity(y, p)[0],
+    'specificity': lambda y, p: mc.sensitivity_specificity(y, p)[1],
     'balanced_accuracy_lib': mc.balanced_accuracy,
     'youden_j': mc.youden_j,
     'matthews_corrcoef': matthews_corrcoef,
@@ -72,12 +72,11 @@ metrics_lib_proba: Dict[str, Any] = {
     'lift': mc.lift,
     'gini': mc.gini,
     'ks_stat_bin_class': mc.ks_stat_bin_class,
-    'ece': lambda x, y: mc.ece_mce_fast(x, y)[0],
-    'mce': lambda x, y: mc.ece_mce_fast(x, y)[1],
+    'ece': lambda y, s: mc.ece_mce_fast(y, s)[0],
+    'mce': lambda y, s: mc.ece_mce_fast(y, s)[1],
 }
 
 
-# Calculate the same metric set as the reference model, using fixed threshold from parameters.py.
 def evaluate_metrics(
     model: CatBoostClassifier,
     df: pd.DataFrame,
@@ -86,58 +85,42 @@ def evaluate_metrics(
     prefix: str,
 ) -> Dict[str, Any]:
     y_true = df[target].to_numpy()
-    y_pred_proba = df[score].to_numpy()
-    y_pred = (y_pred_proba >= threshold_value).astype(int)
+    y_score = df[score].to_numpy()
+    y_pred = (y_score >= threshold_value).astype(int)
 
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    balanced_accuracy = balanced_accuracy_score(y_true, y_pred)
-    pr_auc = mc.precision_recall_auc(y_true, y_pred_proba)
+    metrics = {
+        'roc_auc': roc_auc_score(y_true, y_score),
+        'precision': precision_score(y_true, y_pred, zero_division=0),
+        'recall': recall_score(y_true, y_pred, zero_division=0),
+        'f1': f1_score(y_true, y_pred, zero_division=0),
+        'f05': fbeta_score(y_true, y_pred, beta=0.5, zero_division=0),
+        'f2': fbeta_score(y_true, y_pred, beta=2, zero_division=0),
+        'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
+    }
+    metrics.update({name: method(y_true, y_score) for name, method in metrics_lib_proba.items()})
+    metrics.update({name: method(y_true, y_score if name == 'log_loss' else y_pred) for name, method in metrics_lib.items()})
+    metrics = {f'threshold {prefix} {name}': value for name, value in metrics.items()}
 
     if log:
         logging.info(f'Threshold: {threshold_value}')
-        logging.info(f'Precision: {precision:.3f}')
-        logging.info(f'Recall: {recall:.3f}')
-        logging.info(f'F1-score: {f1:.3f}')
-        logging.info(f'Balanced accuracy: {balanced_accuracy:.3f}')
-        logging.info(f'PR-AUC: {pr_auc:.3f}')
+        for name, value in metrics.items():
+            logging.info(f'{name}: {value:.4f}')
 
-    metrics = {
-        'precision': np.round(precision, 4),
-        'recall': np.round(recall, 4),
-        'f1': np.round(f1, 4),
-        'balanced_accuracy': np.round(balanced_accuracy, 4),
-    }
-
-    for metric_name, method in metrics_lib_proba.items():
-        metrics[metric_name] = method(y_true, y_pred_proba)
-
-    for metric_name, method in metrics_lib.items():
-        metric_input = y_pred_proba if metric_name == 'log_loss' else y_pred
-        metrics[metric_name] = method(y_true, metric_input)
-
-    metrics = {f'threshold {prefix} {k}': v for k, v in metrics.items()}
     return {'model': model, 'threshold': threshold_value, 'metrics': metrics}
 
 
-# Train one CatBoost model on a train fold and evaluate it on the validation fold.
 def train_model(
     df_train: pd.DataFrame,
     df_val: pd.DataFrame,
     features: List[str],
     plot: bool,
+    model_params: Dict[str, Any],
 ) -> Dict[str, Any]:
-    x_train = df_train[features]
-    y_train = df_train[target].to_numpy()
-    x_val = df_val[features]
-    y_val = df_val[target].to_numpy()
-
-    counter = Counter(y_train)
-    minority_to_majority_ratio = counter[1] / counter[0] if counter[0] else 1.0
-    class_weights = [minority_to_majority_ratio, 1.0]
+    counter = Counter(df_train[target].to_numpy())
+    class_weights = [counter[1] / counter[0] if counter[0] else 1.0, 1.0]
 
     model = CatBoostClassifier(
+        **model_params,
         use_best_model=True,
         verbose=False,
         random_seed=RANDOM_STATE,
@@ -148,23 +131,21 @@ def train_model(
         thread_count=-1,
     )
     model.fit(
-        x_train,
-        y_train,
-        eval_set=(x_val, y_val),
+        df_train[features],
+        df_train[target],
+        eval_set=(df_val[features], df_val[target]),
         use_best_model=True,
         plot=plot,
         plot_file='training_plot.html',
     )
 
     df_val = df_val.copy()
-    df_val[score] = model.predict_proba(x_val)[:, 1]
-
+    df_val[score] = model.predict_proba(df_val[features])[:, 1]
     result = evaluate_metrics(model, df_val, threshold, plot, 'cv')
     result['best_iteration'] = model.get_best_iteration()
     return result
 
 
-# Main entry point used by the training pipeline.
 def train(event_timestamp: datetime) -> None:
     logging.info('Start train')
     t_train = time.time()
@@ -174,110 +155,111 @@ def train(event_timestamp: datetime) -> None:
     session = state.spark.session
     event_date = event_timestamp.date().isoformat()
 
-    # Clean local artifacts before a new MLflow run.
-    Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
-    for file in Path(artifacts_dir).rglob('*'):
+    artifacts_path = Path(artifacts_dir)
+    artifacts_path.mkdir(parents=True, exist_ok=True)
+    for file in artifacts_path.rglob('*'):
         if file.is_file():
             file.unlink()
 
-    # Load train and holdout datasets prepared by preprocess.py.
     input_prefix = state.settings.preprocess_prefix(event_timestamp) / input_suffix
     input_bucket = input_prefix.split('//')[1].split('/')[0]
     input_prefix = '/'.join(input_prefix.split('//')[1].split('/')[1:])
     input_path = template.format(bucket=input_bucket, prefix=input_prefix)
 
-    df_train = session.read.parquet(f'{input_path}/train').toPandas()
-    df_holdout = session.read.parquet(f'{input_path}/holdout').toPandas()
-    
+    try:
+        df_train = utils.load_dataset(session, f'{input_path}/train')
+        df_holdout = utils.load_dataset(session, f'{input_path}/holdout')
+    except Exception:
+        logging.exception(f'Failed to load datasets from {input_path}')
+        raw_input_prefix = state.settings.preprocess_prefix(event_timestamp) / input_suffix
+        legacy_input_path = template.format(bucket=input_bucket, prefix=str(raw_input_prefix).strip('/'))
+        logging.info(f'Trying legacy preprocess path: {legacy_input_path}')
+        df_train = utils.load_dataset(session, f'{legacy_input_path}/train')
+        df_holdout = utils.load_dataset(session, f'{legacy_input_path}/holdout')
+
     missing_features = sorted(set(features) - set(df_train.columns))
     assert not missing_features, f'Missing features in train dataset: {missing_features}'
     assert target in df_train.columns, f'{target} is missing in train dataset'
     assert target in df_holdout.columns, f'{target} is missing in holdout dataset'
     assert not (set(df_train['contact_id']) & set(df_holdout['contact_id'])), 'Train and holdout contact_id overlap'
-
     logging.info(f'Train target rate: {df_train[target].mean():.6f}')
     logging.info(f'Holdout target rate: {df_holdout[target].mean():.6f}')
 
-    train_results = []
+    from cvm_model.optuna_tuning import tune_catboost_params
+
+    best_params, best_optuna_score = tune_catboost_params(
+        df=df_train,
+        features=features,
+        target=target,
+        random_state=RANDOM_STATE,
+        n_folds=5,
+        n_trials=30,
+    )
+
     skf = StratifiedKFold(n_splits=5, random_state=RANDOM_STATE, shuffle=True)
-    for i, (train_index, val_index) in enumerate(skf.split(df_train[features], df_train[target])):
-        logging.info(f'Fold {i}')
-        result = train_model(
-            df_train.iloc[train_index],
-            df_train.iloc[val_index],
-            features,
-            False,
-        )
-        train_results.append(result)
-
-    best_iteration_cv = np.round(np.mean([x['best_iteration'] for x in train_results]), 2)
-    logging.info(f'Cross-validation fixed_threshold: {threshold}; best_iteration: {best_iteration_cv}')
-
-    cv_metrics_values = np.array([list(x['metrics'].values()) for x in train_results])
-    cv_metrics_values = cv_metrics_values.mean(axis=0)
+    train_results = [
+        train_model(df_train.iloc[train_idx], df_train.iloc[val_idx], features, False, best_params)
+        for train_idx, val_idx in skf.split(df_train[features], df_train[target])
+    ]
+    best_iteration_cv = float(np.round(np.mean([res['best_iteration'] for res in train_results]), 2))
     cv_metrics = {
-        f'cv mean {k}': v for k, v in zip(train_results[0]['metrics'], cv_metrics_values)
+        f'cv mean {key}': value
+        for key, value in zip(
+            train_results[0]['metrics'],
+            np.array([list(res['metrics'].values()) for res in train_results]).mean(axis=0),
+        )
     }
     logging.info(f'StratifiedKFold metrics: {cv_metrics}')
 
-    train_result_final = train_model(df_train, df_holdout, features, True)
+    train_result_final = train_model(df_train, df_holdout, features, True, best_params)
     model = train_result_final['model']
     best_iteration_train = train_result_final['best_iteration']
-    logging.info(f'Final model threshold: {threshold}; best_iteration: {best_iteration_train}')
 
     df_train = df_train.copy()
     df_holdout = df_holdout.copy()
     df_train[score] = model.predict_proba(df_train[features])[:, 1]
     df_holdout[score] = model.predict_proba(df_holdout[features])[:, 1]
 
-    holdout_metrics = evaluate_metrics(model, df_holdout, threshold, True, 'holdout')
     train_metrics = evaluate_metrics(model, df_train, threshold, True, 'train')
-    logging.info(f'Holdout metrics: {holdout_metrics["metrics"]}')
+    holdout_metrics = evaluate_metrics(model, df_holdout, threshold, True, 'holdout')
     logging.info(f'Train metrics: {train_metrics["metrics"]}')
+    logging.info(f'Holdout metrics: {holdout_metrics["metrics"]}')
 
-    # Save standard diagnostics plots for MLflow artifacts.
-    t = df_holdout[target]
-    s = df_holdout[score]
-    c = s >= threshold
+    y_true = df_holdout[target]
+    y_score = df_holdout[score]
+    y_pred = y_score >= threshold
 
-    func.plot_precision_recall_curve(t, s, artifacts_dir=artifacts_dir)
-    func.plot_roc(t, s, artifacts_dir=artifacts_dir)
+    func.plot_precision_recall_curve(y_true, y_score, artifacts_dir=artifacts_dir)
+    func.plot_roc(y_true, y_score, artifacts_dir=artifacts_dir)
 
     plt.figure(figsize=(8, 6))
-    sns.histplot(s[t == 0], label='not churn', kde=True, stat='density', color='blue')
-    sns.histplot(s[t == 1], label='churn', kde=True, stat='density', alpha=0.2, color='orange')
-    title = 'Labeled Score Histogram'
-    plt.title(title)
+    sns.histplot(y_score[y_true == 0], label='not churn', kde=True, stat='density', color='blue')
+    sns.histplot(y_score[y_true == 1], label='churn', kde=True, stat='density', alpha=0.2, color='orange')
+    plt.title('Labeled Score Histogram')
     plt.legend()
-    plt.savefig(os.path.join(artifacts_dir, title), bbox_inches='tight')
+    plt.savefig(artifacts_path / 'Labeled Score Histogram', bbox_inches='tight')
     plt.close()
 
-    cm = confusion_matrix(t, c)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['not churn', 'churn'])
-    disp.plot(cmap=plt.cm.Blues, values_format='d')
-    title = 'Confusion Matrix'
-    plt.title(title)
-    plt.savefig(os.path.join(artifacts_dir, title), bbox_inches='tight')
+    ConfusionMatrixDisplay(
+        confusion_matrix=confusion_matrix(y_true, y_pred),
+        display_labels=['not churn', 'churn'],
+    ).plot(cmap=plt.cm.Blues, values_format='d')
+    plt.title('Confusion Matrix')
+    plt.savefig(artifacts_path / 'Confusion Matrix', bbox_inches='tight')
     plt.close()
 
     import shap
 
-    sample_size = min(50_000, len(df_train))
-    sample = df_train[features].sample(sample_size, random_state=RANDOM_STATE)
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(sample)
-    plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, sample, show=False)
-    title = 'SHAP Summary Plot'
-    plt.title(title)
-    plt.savefig(os.path.join(artifacts_dir, title), bbox_inches='tight')
+    sample = df_train[features].sample(min(50_000, len(df_train)), random_state=RANDOM_STATE)
+    shap.summary_plot(shap.TreeExplainer(model).shap_values(sample), sample, show=False)
+    plt.title('SHAP Summary Plot')
+    plt.savefig(artifacts_path / 'SHAP Summary Plot', bbox_inches='tight')
     plt.close()
 
-    Path(os.path.join(artifacts_dir, 'features.txt')).write_text('\n'.join(features), encoding='utf-8')
+    (artifacts_path / 'features.txt').write_text('\n'.join(features), encoding='utf-8')
 
     model_name = f'{project_name}_{model_type}'
     experiment_name = f'{model_name}_{jira}_train'
-    description = f'train_{event_date}_auto'
     params = {
         'event_timestamp': event_date,
         'threshold': threshold,
@@ -288,12 +270,15 @@ def train(event_timestamp: datetime) -> None:
         'holdout_rows': len(df_holdout),
         'train_target_rate': df_train[target].mean(),
         'holdout_target_rate': df_holdout[target].mean(),
+        'optuna_best_pr_auc': best_optuna_score,
+        **{f'catboost_{key}': value for key, value in best_params.items()},
     }
 
     mlflow.set_experiment(experiment_name)
     signature = infer_signature(df_train.head(1)[features], df_train.head(1)[score])
+    run_name = f'train_{event_date}_auto'
 
-    with mlflow.start_run(run_name=description, description=description):
+    with mlflow.start_run(run_name=run_name, description=run_name):
         mlflow.log_params(params)
         mlflow.log_metrics(cv_metrics)
         mlflow.log_metrics(train_metrics['metrics'])
@@ -317,16 +302,13 @@ def train(event_timestamp: datetime) -> None:
         order_by=['version_number DESC'],
     )[0].version
     for key, value in params.items():
-        client.set_model_version_tag(name=model_name, version=last_version, key=key, value=value)
+        client.set_model_version_tag(model_name, last_version, key, value)
 
     train_data_stat_prefix = state.settings.get_prefix(temp=False, suffix=train_data_stat_suffix)
     train_data_stat_bucket = train_data_stat_prefix.split('//')[1].split('/')[0]
     train_data_stat_prefix = '/'.join(train_data_stat_prefix.split('//')[1].split('/')[1:])
-
-    report_cols = features + [target, score]
-    logging.info('Saving train dataset stats...')
     data_stat_prefix = f'{train_data_stat_prefix}/{event_date}/'
-    report = func.get_data_report(df_train, report_cols)
-    su.save_to_s3(report, data_stat_prefix, input_type='df', bucket=train_data_stat_bucket)
+    report = func.get_data_report(df_train, features + [target, score])
+    utils.save_df_to_s3(report, state.credentials.cvm_s3, train_data_stat_bucket, data_stat_prefix)
 
     logging.info(f'End train at {round(time.time() - t_train)} sec')
