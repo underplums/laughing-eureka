@@ -1,12 +1,10 @@
 import logging
-import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from functools import lru_cache
 from io import BytesIO
 from typing import Dict, Generator, List, cast, Optional
 
-import mlflow
 import sqlalchemy as sa
 from sqlalchemy.pool import NullPool
 from decouple import config
@@ -66,18 +64,19 @@ class CredsMlFlow(BaseModel, arbitrary_types_allowed=True):
     insecure_tls: str = 'false'
     server_cert_path: Optional[str] = None
 
-    def setup_tracking(self) -> None:
-        os.environ['MLFLOW_TRACKING_USERNAME'] = self.username
-        os.environ['MLFLOW_TRACKING_PASSWORD'] = self.password.get_secret_value()
-        os.environ['MLFLOW_TRACKING_INSECURE_TLS'] = self.insecure_tls
+    @computed_field
+    @property
+    def environment(self) -> Dict[str, str]:
+        env = {
+            'MLFLOW_TRACKING_USERNAME': self.username,
+            'MLFLOW_TRACKING_PASSWORD': self.password.get_secret_value(),
+            'MLFLOW_TRACKING_INSECURE_TLS': self.insecure_tls,
+        }
 
         if self.server_cert_path:
-            os.environ['MLFLOW_TRACKING_SERVER_CERT_PATH'] = self.server_cert_path
+            env['MLFLOW_TRACKING_SERVER_CERT_PATH'] = self.server_cert_path
 
-        if self.tracking_uri:
-            mlflow.set_tracking_uri(self.tracking_uri)
-
-        logging.info(f'MLflow tracking URI: {mlflow.get_tracking_uri()}')
+        return env
 
 
 class CredsS3(BaseModel, arbitrary_types_allowed=True):
