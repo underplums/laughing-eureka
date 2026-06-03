@@ -37,7 +37,7 @@ distributed by({distribution_col})
 
 aud_query = """
 select distinct 
-    contact_id::int
+    contact_id::bigint
 from dm.prvdr_dac_monthly
 where date_month = date'{base_month}'
 and has_transaction_activity = 1
@@ -56,7 +56,7 @@ with aud as (
 
 dac_next_month as (
     select distinct 
-        contact_id :: int
+        contact_id :: bigint
         , 1 :: int is_dac_next_month
     from dm.prvdr_dac_monthly
     where date_month = date '{target_month}'
@@ -86,42 +86,42 @@ with aud as (
 
 cheques as (
     select
-        c.contact_id :: int
+        c.contact_id :: bigint
         , date'{date}' - max(c.datetime::date) cheque_recency
     from cvm_sbx.v_cheque_filtered c
     join aud a
-        on a.contact_id = c.contact_id :: int
+        on a.contact_id = c.contact_id :: bigint
     where true
     and c.datetime :: date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
     and c.contact_id is not null
     and c.sale_channel_id in (0, 1, 2)
-    group by c.contact_id :: int
+    group by c.contact_id :: bigint
 ), 
 
 logins as (
     select 
-        d.contact_id :: int
+        d.contact_id :: bigint
         , date'{date}' - max(date(d.ptn_dt)) login_recency
     from dm.prvrd_dau_main_metrics d
     join aud a
-        on a.contact_id = d.contact_id :: int
+        on a.contact_id = d.contact_id :: bigint
     where 1=1
     and d.ptn_dt between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
-    group by d.contact_id :: int
+    group by d.contact_id :: bigint
 ), 
 
 omni_qr_and_features as (
     select 
-        u.customer_id :: int contact_id
+        u.customer_id :: bigint contact_id
         , date'{date}' - max(case when u.feature = 'QR' then date(u.event_date) end) omni_qr_recency
         , date'{date}' - max(case when u.feature != 'QR' then date(u.event_date) end) omni_features_recency
     from dm.prvrd_omni_features_usage u
     join aud a
-        on a.contact_id = u.customer_id :: int
+        on a.contact_id = u.customer_id :: bigint
     where 1=1
     and u.event_date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
     and u.target_cnt > 0
-    group by u.customer_id :: int
+    group by u.customer_id :: bigint
 )
 
 select *
@@ -138,11 +138,11 @@ with aud as (
 
 perf as (
     select 
-        t2.contact_id :: int
+        t2.contact_id :: bigint
         , date'{date}' - max(install_date) perf_recency
     from dm.pvdr_appsflyer_installs_gr t1
     join dm.contact t2 on t1.magnit_id = t2.magnit_id
-    join aud a on a.contact_id = t2.contact_id :: int
+    join aud a on a.contact_id = t2.contact_id :: bigint
     where true
     and install_date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
     group by 1
@@ -159,14 +159,14 @@ with aud as (
 
 cheques as (
     select
-        c.contact_id :: int
+        c.contact_id :: bigint
         , c.orgunit_id
         , c.summ_discounted :: real rto
         , date(c.datetime) - lag(date(c.datetime)) over (partition by c.contact_id order by date(c.datetime)) trans_lag
         , c.datetime :: date
     from cvm_sbx.v_cheque_filtered c
     join aud a
-        on a.contact_id = c.contact_id :: int
+        on a.contact_id = c.contact_id :: bigint
     where true
     and c.datetime :: date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
     and c.contact_id is not null
@@ -237,14 +237,14 @@ with aud as (
 
 cheques as (
     select 
-        c.contact_id :: int
+        c.contact_id :: bigint
         , c.summ_discounted :: real rto
         , date(c.datetime) - lag(date(c.datetime)) over (partition by c.contact_id order by date(c.datetime)) trans_lag
         , c.sale_channel_id
         , c.datetime :: date
     from cvm_sbx.v_cheque_filtered c
     join aud a
-        on a.contact_id = c.contact_id :: int
+        on a.contact_id = c.contact_id :: bigint
     where true
     and c.datetime :: date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
     and c.contact_id is not null
@@ -265,11 +265,11 @@ group by contact_id
 app_query = '''
 with logins as (
     select 
-        c.contact_id :: int
+        c.contact_id :: bigint
         , date(ptn_dt) - lag(date(ptn_dt)) over (partition by c.contact_id order by date(ptn_dt)) login_lag
     from dm.prvrd_dau_main_metrics d
     join ({aud}) c
-        on c.contact_id = d.contact_id :: int
+        on c.contact_id = d.contact_id :: bigint
     where 1=1
     and ptn_dt between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
 )
@@ -285,11 +285,11 @@ group by contact_id
 omni_qr_query = """
 with omni_qr as (
     select 
-        customer_id :: int contact_id
+        customer_id :: bigint contact_id
         , date(event_date) - lag(date(event_date)) over (partition by customer_id order by date(event_date)) omni_qr_lag
     from dm.prvrd_omni_features_usage u
     join ({aud}) c
-        on c.contact_id = u.customer_id::int
+        on c.contact_id = u.customer_id::bigint
     where 1=1
     and event_date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
     and target_cnt > 0
@@ -306,11 +306,11 @@ group by contact_id
 omni_features_query = """
 with omni_features as (
     select 
-        customer_id :: int contact_id
+        customer_id :: bigint contact_id
         , date(event_date) - lag(date(event_date)) over (partition by customer_id order by date(event_date)) omni_features_lag
     from dm.prvrd_omni_features_usage u
     join ({aud}) c
-        on c.contact_id = u.customer_id::int
+        on c.contact_id = u.customer_id::bigint
     where 1=1
     and event_date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
     and target_cnt > 0
@@ -328,12 +328,12 @@ group by contact_id
 fav_omni_features_create_query = """
 with f_sum as (
     select 
-        customer_id :: int contact_id
+        customer_id :: bigint contact_id
         , feature
         , sum(1) :: int feature_days_count  -- equals to count(distinct event_date) - tested
     from dm.prvrd_omni_features_usage u
     join ({aud}) c
-        on c.contact_id = u.customer_id::int
+        on c.contact_id = u.customer_id::bigint
     where 1=1
     and event_date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
     and target_cnt > 0
@@ -360,12 +360,12 @@ where feature_days_count = feature_days_count_max
 fav_omni_features_select_query = """
 with f_sum as (
     select 
-        customer_id :: int contact_id
+        customer_id :: bigint contact_id
         , feature
         , sum(1) :: int feature_days_count
     from dm.prvrd_omni_features_usage u
     join ({aud}) c
-        on c.contact_id = u.customer_id::int
+        on c.contact_id = u.customer_id::bigint
     where 1=1
     and event_date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
     and target_cnt > 0
@@ -373,7 +373,7 @@ with f_sum as (
 )
 
 select 
-    u.contact_id::int
+    u.contact_id::bigint
     , sum(u.feature_days_count)::int omni_fav_features_days_count_{month}
 from f_sum u
 join {fav_omni_features_table} f
@@ -385,11 +385,11 @@ group by u.contact_id
 
 omni_unique_features_count_query = """
 select 
-    customer_id :: int contact_id
+    customer_id :: bigint contact_id
     , count(distinct feature) :: int omni_unique_features_count_{month}
 from dm.prvrd_omni_features_usage u
 join ({aud}) c
-    on c.contact_id = u.customer_id::int
+    on c.contact_id = u.customer_id::bigint
 where 1=1
 and event_date between date'{date}' - interval '{month} month' and date'{date}' - interval '1 day'
 and target_cnt > 0
@@ -399,7 +399,7 @@ group by customer_id
 
 omni_goals_query = """
 select 
-    contact_id :: int contact_id
+    contact_id :: bigint contact_id
     , sum(case when event_name = 'goal_activated' then 1 end) :: int omni_goals_activated_count_{month}
     , count(distinct case when event_name = 'goal_updated' then goal_id end) :: int omni_goals_updated_count_{month}
     , sum(case when event_name = 'goal_finished' then 1 end) :: int omni_goals_finished_count_{month}
@@ -439,7 +439,7 @@ accept as (
 )
 
 select 
-    contact_id :: int
+    contact_id :: bigint
     , sum(accept_count)::int accept_count_{month}
 from accept
 group by contact_id
@@ -458,7 +458,7 @@ card as (
 )
 
 select 
-    contact_id::int
+    contact_id::bigint
     , sum(case when bonus_type = 'addition' then value / 100 end :: real)                                 bonus_accrued_sum_{month}
     , sum(case when parent_type_id is not null and bonus_type = 'addition' then value / 100 end :: real)  bonus_accrued_offer_sum_{month}
     , sum(case when parent_type_id = 6 and bonus_type = 'write_off' then value / -100 end :: real)        bonus_expired_sum_{month}
@@ -472,7 +472,7 @@ group by contact_id
 
 level_query = """
 select 
-    contact_id::int
+    contact_id::bigint
     , avg(level_id) :: real avg_level_{month}
 from dm.contact_loyality_lvl_month
 join ({aud}) aud using(contact_id)
@@ -488,14 +488,14 @@ with aud as (
 
 cohort as (
     select 
-        contact_id::int  -- uniques positive
+        contact_id::bigint  -- uniques positive
         , extract(year from age(date'{date}', first_dac_month)) * 12 + extract(month from age(date'{date}', first_dac_month)) :: int dac_age_months
     from dm.prvdr_dac_cohorts
 ),
 
 demo as (
     select 
-        contact_id::int  -- uniques negative
+        contact_id::bigint  -- uniques negative
         , max(extract(year from age(date'{date}', birth_date)))::int cust_age_years
         , max(case when gendercalc = 'M' then 1 else 0 end) :: int is_male
     from dm.contact
@@ -515,7 +515,7 @@ with aud as (
 
 monthly_activity as (
     select
-        d.contact_id :: int AS contact_id,
+        d.contact_id :: bigint AS contact_id,
         d.date_month,
         case
             when d.has_transaction_activity = 1
@@ -563,7 +563,7 @@ window_agg AS (
     group by contact_id
 )
 select
-    aud.contact_id :: int,
+    aud.contact_id :: bigint,
     coalesce(w.dac_months_count, 0) :: int AS dac_months_count,
     coalesce(w.dac_months_last_3, 0) :: int AS dac_months_last_3,
     coalesce(w.dac_months_last_6, 0) :: int AS dac_months_last_6,
