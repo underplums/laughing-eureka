@@ -21,8 +21,6 @@
 
 `cvm_churn-from-dac_binary-class_churn-dac` is a binary classification project for predicting DAC churn.
 
-The model scores clients who were DAC in the base month and estimates the probability that they will stop being DAC in the next month.
-
 DAC is defined as a client with transaction activity and at least one digital activity signal in the same month:
 
 ```sql
@@ -43,45 +41,30 @@ target_churn_from_dac = 0, if the client was DAC in base_month and remains DAC i
 
 Model type: CatBoost binary classifier with isotonic score calibration.
 
-Detailed project description: add Confluence link after business approval.
+[Confluence](https://it-portal.corp.tander.ru/pages/viewpage.action?pageId=2160460511)
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Getting Started
 
-### Prerequisites
-
-The project is intended to run on the stream Dataproc/JupyterHub environment with access to GP, S3, Spark and MLflow credentials.
-
-Required environment variables are loaded by `cvm_model.io.State.from_env()`:
-
-- `GP_LOYALTY_USER`
-- `GP_LOYALTY_PASSWORD`
-- `GP_LOYALTY_HOST`
-- `GP_LOYALTY_PORT`
-- `GP_LOYALTY_DB`
-- `CH_CVM_USER`
-- `CH_CVM_PASSWORD`
-- `CH_CVM_HOST`
-- `CH_CVM_PORT`
-- `CH_CVM_DB`
-- `AWS_ENDPOINT_URL`
-- `AWS_DEFAULT_REGION`
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `PXF_SERVER_PROFILE`
-- `MLFLOW_TRACKING_USERNAME`
-- `MLFLOW_TRACKING_PASSWORD`
-- `MLFLOW_TRACKING_URI`
-- `MLFLOW_TRACKING_INSECURE_TLS`
-- `MLFLOW_TRACKING_SERVER_CERT_PATH` or `MLFLOW_TRACKING_SERVER_CER_PATH`
-- `S3_PERMANENT_STORAGE_PREFIX`
-- `S3_TEMPORARY_STORAGE_PREFIX`
-- `FEATURE_STORE_S3_ROOT`
-
 ### Installation
 
-Install project dependencies with Poetry:
+1. Clone the repository
+
+```bash
+git clone git@coderepo.corp.tander.ru:cvm_de/cvm-ml-platform/rnd/cvm_churn-from-dac_binary-class_churn-dac.git
+```
+2. Navigate to the project directory
+
+```bash
+cd cvm_churn-from-dac_binary-class_churn-dac
+```
+3. Initialize and update submodules
+
+```bash
+git submodule update --init --recursive
+```
+4. Install project dependencies with Poetry:
 
 ```bash
 poetry install
@@ -91,83 +74,51 @@ poetry install
 
 ## Usage
 
-All commands use `event_timestamp` as the logical pipeline date.
+All commands use `<EVENT_TIMESTAMP>` as the logical pipeline date.
 
 Train preprocessing:
 
 ```bash
-poetry run python -m cvm_model_entrypoint train preprocess --event-timestamp 2026-06-01
+poetry run python -m cvm_model_entrypoint train preprocess --event-timestamp <EVENT_TIMESTAMP>
 ```
+[Notebook](https://coderepo.corp.tander.ru/cvm_de/cvm-ml-platform/rnd/cvm_churn-from-dac_binary-class_churn-dac/-/blob/feature/CVMB-24239/src/cvm_model/notebooks/train_preprocess_pipe.ipynb)
 
 Train:
 
 ```bash
-poetry run python -m cvm_model_entrypoint train run --event-timestamp 2026-06-01
+poetry run python -m cvm_model_entrypoint train run --event-timestamp <EVENT_TIMESTAMP>
 ```
+
+[Notebook](https://coderepo.corp.tander.ru/cvm_de/cvm-ml-platform/rnd/cvm_churn-from-dac_binary-class_churn-dac/-/blob/feature/CVMB-24239/src/cvm_model/notebooks/train_pipe.ipynb)
 
 Inference preprocessing:
 
 ```bash
-poetry run python -m cvm_model_entrypoint inference preprocess --event-timestamp 2026-06-01
+poetry run python -m cvm_model_entrypoint inference preprocess --event-timestamp <EVENT_TIMESTAMP>
 ```
+
+[Notebook](https://coderepo.corp.tander.ru/cvm_de/cvm-ml-platform/rnd/cvm_churn-from-dac_binary-class_churn-dac/-/blob/feature/CVMB-24239/src/cvm_model/notebooks/inference_preprocess_pipe.ipynb)
 
 Inference:
 
 ```bash
-poetry run python -m cvm_model_entrypoint inference run --event-timestamp 2026-06-01 --train-event-timestamp 2026-06-01
+poetry run python -m cvm_model_entrypoint inference run --event-timestamp <EVENT_TIMESTAMP> --train-event-timestamp <TRAIN_EVENT_TIMESTAMP>
 ```
+[Notebook](https://coderepo.corp.tander.ru/cvm_de/cvm-ml-platform/rnd/cvm_churn-from-dac_binary-class_churn-dac/-/blob/feature/CVMB-24239/src/cvm_model/notebooks/inference_pipe.ipynb)
 
 Date logic for `event_timestamp = 2026-06-01`:
 
 - train audience: DAC clients from `2026-04-01`;
-- train target: churn from DAC in `2026-05-01`;
+- train target: DAC churn in `2026-05-01`;
 - train features: history before `2026-05-01`;
 - inference audience: DAC clients from `2026-05-01`;
 - inference features: history before `2026-06-01`;
 - inference scores: probability of DAC churn in June.
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-## Data Storage
-
-Train and holdout datasets are saved to temporary S3 storage:
-
-```text
-S3_TEMPORARY_STORAGE_PREFIX/<event_timestamp>/input/train/
-S3_TEMPORARY_STORAGE_PREFIX/<event_timestamp>/input/holdout/
-```
-
-Inference dataset is saved to temporary S3 storage:
-
-```text
-S3_TEMPORARY_STORAGE_PREFIX/<event_timestamp>/input/inference/
-```
-
-Model predictions are saved to permanent S3 storage:
-
-```text
-S3_PERMANENT_STORAGE_PREFIX/model_predictions/<event_timestamp>/
-```
-
-Train and inference data statistics are saved to permanent S3 storage:
-
-```text
-S3_PERMANENT_STORAGE_PREFIX/data_stat/train/<event_timestamp>/
-S3_PERMANENT_STORAGE_PREFIX/data_stat/inference/<event_timestamp>/
-```
-
-The model is logged and registered in MLflow with the name:
-
-```text
-cvm_churn-from-dac_binary-class_churn-dac_catboost
-```
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
 ## Contact
 
-Owner: gorelova_i_v
+Горелова Ирина (gorelova_i_v) - gorelova_i_v@magnit.ru
 
-Project repository: `cvm_churn-from-dac_binary-class_churn-dac`
+[Project Link](https://coderepo.corp.tander.ru/cvm_de/cvm-ml-platform/rnd/cvm_churn-from-dac_binary-class_churn-dac)
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>

@@ -1,15 +1,7 @@
-# Changelog
-All notable changes to this project will be documented in this file.
-
-## [0.1.1] - 2026-06-02
-### Fixed
-- Aligned train data statistics storage with permanent S3 storage.
-- Added mandatory `customer_id` field to inference predictions output.
-- Aligned permanent S3 paths with the existing project settings object.
-
+## [0.1.0] - 2026-06-19
 ### Added
-- Added project README with task description, setup, run commands and S3 storage layout.
-
-## [0.1.0] - 2026-06-02
-### Added
-- MVP pipeline for DAC churn model training and inference.
+- MVP train preprocessing pipeline with DAC audience extraction, target labeling, feature loading, train/holdout split and temporary S3 storage.
+- CatBoost train pipeline with Optuna tuning, StratifiedKFold validation, isotonic calibration, MLflow metrics, plots, artifacts and model registration.
+- Inference preprocessing pipeline with DAC scoring audience extraction, feature loading, validation and temporary S3 storage.
+- Inference pipeline with MLflow model loading by train event timestamp, S3 prediction output and data statistics for drift monitoring.
+- README with project description, run commands, date logic and S3 storage layout.
